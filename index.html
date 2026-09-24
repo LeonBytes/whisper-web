@@ -148,6 +148,8 @@
       // 状态提示
       decoding: "正在读取并解码音频…",
       downloadingLink: "正在读取链接中的文件…",
+      extractAudio: "正在从视频里提取音轨…",
+      unsupportedAudio: "这个视频的音频编码（{codec}）暂不支持直接读取。请先用“快捷指令”转成 m4a 再试。",
       badUrl: "这个链接格式不对，请粘贴以 http:// 或 https:// 开头的完整链接。",
       platformLink: "YouTube、TikTok 等平台的页面链接无法直接转录（网页不能读取它们的音视频）。请先把视频保存成文件，再点“选择文件”。",
       fetchFail: "无法读取这个链接。可能它不是音视频文件本身，或对方服务器不允许网页跨站读取。请下载文件后用“选择文件”。",
@@ -197,6 +199,8 @@
       // status messages
       decoding: "Reading and decoding audio…",
       downloadingLink: "Fetching the file from the link…",
+      extractAudio: "Extracting the audio track from the video…",
+      unsupportedAudio: "The audio format in this video ({codec}) can't be read directly. Please convert it to m4a first (for example with the Shortcuts app) and try again.",
       badUrl: "That doesn't look like a valid link. Paste the full link starting with http:// or https://.",
       platformLink: "Page links from YouTube, TikTok and similar sites can't be transcribed directly (a web page can't read their audio or video). Save the video as a file first, then use “Choose file”.",
       fetchFail: "Couldn't read this link. It may not be the audio/video file itself, or the server doesn't allow cross-site reads from web pages. Download the file and use “Choose file” instead.",
@@ -319,14 +323,237 @@
   }
 
   // 解码音频并重采样为 16kHz 单声道 Float32Array（Whisper 需要的格式）
-  async function decodeTo16kMono(file) {
-    return decodeBuffer(await file.arrayBuffer());
+  async function decodeTo16kMono(blob) {
+    return resampleTo16kMono(await decodeToAudioBuffer(blob));
   }
 
   // 带"文案键"的错误：捕获后直接按当前语言显示，切换语言时也会跟着变
   class UserError extends Error {
     constructor(key, params) { super(key); this.key = key; this.params = params || null; }
   }
+
+  // ==== MP4-DEMUX-START ====
+  // 备用解码：从 MOV / MP4 / M4V 里取出 AAC 音轨，给每一帧加上 ADTS 头，再交给浏览器解码。
+  // 只读取音频数据所在的片段，不需要把整个视频读进内存。
+  const AAC_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+
+  async function readBytes(blob, start, end) {
+    return new Uint8Array(await blob.slice(start, end).arrayBuffer());
+  }
+  function fourcc(v, o) {
+    return String.fromCharCode(v.getUint8(o), v.getUint8(o + 1), v.getUint8(o + 2), v.getUint8(o + 3));
+  }
+
+  // 列出 [start, end) 范围内同一层的所有 box：{ type, start（内容起点）, end }
+  function listBoxes(v, start, end) {
+    const out = [];
+    let p = start;
+    while (p + 8 <= end) {
+      let size = v.getUint32(p);
+      const type = fourcc(v, p + 4);
+      let head = 8;
+      if (size === 1) { size = Number(v.getBigUint64(p + 8)); head = 16; }
+      else if (size === 0) size = end - p;
+      if (size < head || p + size > end) break;
+      out.push({ type, start: p + head, end: p + size });
+      p += size;
+    }
+    return out;
+  }
+  function child(v, box, type) {
+    return listBoxes(v, box.start, box.end).find((b) => b.type === type);
+  }
+
+  // 在文件顶层找到 moov（轨道目录），只把它读进内存；不是 MP4/MOV 系列则返回 null
+  async function readMoov(blob) {
+    const known = ["ftyp", "moov", "mdat", "free", "wide", "skip", "junk", "pnot"];
+    let pos = 0;
+    for (let guard = 0; guard < 10000 && pos + 8 <= blob.size; guard++) {
+      const head = await readBytes(blob, pos, Math.min(pos + 16, blob.size));
+      const v = new DataView(head.buffer, head.byteOffset, head.byteLength);
+      let size = v.getUint32(0);
+      const type = fourcc(v, 4);
+      if (pos === 0 && !known.includes(type)) return null;
+      let headLen = 8;
+      if (size === 1) {
+        if (head.length < 16) return null;
+        size = Number(v.getBigUint64(8));
+        headLen = 16;
+      } else if (size === 0) size = blob.size - pos;
+      if (size < headLen) return null;
+      if (type === "moov") return await readBytes(blob, pos + headLen, pos + size);
+      pos += size;
+    }
+    return null;
+  }
+
+  // esds 里的描述符长度：每字节低 7 位有效，最高位表示后面还有
+  function readDescLen(b, p) {
+    let len = 0;
+    for (let n = 0; n < 4; n++) {
+      const c = b[p++];
+      len = (len << 7) | (c & 0x7f);
+      if (!(c & 0x80)) break;
+    }
+    return { len, p };
+  }
+  // p 指向 esds 的第一个描述符（ES_Descriptor）；返回编码类型和 AudioSpecificConfig
+  function parseEsds(b, p) {
+    if (b[p] !== 0x03) return null;
+    let r = readDescLen(b, p + 1); p = r.p;
+    p += 2;                       // ES_ID
+    const flags = b[p++];
+    if (flags & 0x80) p += 2;
+    if (flags & 0x40) p += 1 + b[p];
+    if (flags & 0x20) p += 2;
+    if (b[p] !== 0x04) return null;
+    r = readDescLen(b, p + 1); p = r.p;
+    const oti = b[p];
+    p += 13;                      // 类型(1) 流类型(1) 缓冲(3) 最大码率(4) 平均码率(4)
+    if (b[p] !== 0x05) return null;
+    r = readDescLen(b, p + 1); p = r.p;
+    return { oti, asc: b.subarray(p, p + r.len) };
+  }
+  // AudioSpecificConfig：编码类型(5 位)、采样率序号(4 位)、声道配置(4 位)
+  function parseAsc(asc) {
+    let bit = 0;
+    const read = (n) => {
+      let x = 0;
+      for (let i = 0; i < n; i++) {
+        x = (x << 1) | (((asc[bit >> 3] ?? 0) >> (7 - (bit & 7))) & 1);
+        bit++;
+      }
+      return x;
+    };
+    let aot = read(5);
+    if (aot === 31) aot = 32 + read(6);
+    let sfi = read(4);
+    if (sfi === 15) { read(24); sfi = -1; }
+    const ch = read(4);
+    if (aot === 5 || aot === 29) {          // HE-AAC：真正的核心编码类型在后面
+      const ext = read(4);
+      if (ext === 15) read(24);
+      aot = read(5);
+      if (aot === 31) aot = 32 + read(6);
+    }
+    return { aot, sfi, ch };
+  }
+
+  async function extractAac(blob) {
+    const moov = await readMoov(blob);
+    if (!moov) return null;
+    const v = new DataView(moov.buffer, moov.byteOffset, moov.byteLength);
+    const bytes = new Uint8Array(moov.buffer, moov.byteOffset, moov.byteLength);
+
+    // 找到第一条音频轨道（handler 为 soun）的采样表
+    let stbl = null;
+    for (const trak of listBoxes(v, 0, moov.length).filter((b) => b.type === "trak")) {
+      const mdia = child(v, trak, "mdia");
+      const hdlr = mdia && child(v, mdia, "hdlr");
+      if (!hdlr || fourcc(v, hdlr.start + 8) !== "soun") continue;
+      const minf = child(v, mdia, "minf");
+      stbl = minf && child(v, minf, "stbl");
+      if (stbl) break;
+    }
+    if (!stbl) return null;
+
+    // 音频编码信息：QuickTime 的 .mov 常把 esds 包在 wave 里，所以直接在条目里搜索 esds
+    const stsd = child(v, stbl, "stsd");
+    if (!stsd) return null;
+    const entry = stsd.start + 8;
+    const codec = fourcc(v, entry + 4);
+    const entryEnd = Math.min(entry + v.getUint32(entry), stsd.end);
+    let esds = -1;
+    for (let i = entry + 8; i + 4 <= entryEnd; i++) {
+      if (bytes[i] === 0x65 && bytes[i + 1] === 0x73 && bytes[i + 2] === 0x64 && bytes[i + 3] === 0x73) { esds = i; break; }
+    }
+    const es = codec === "mp4a" && esds >= 0 ? parseEsds(bytes, esds + 8) : null;
+    const asc = es ? parseAsc(es.asc) : null;
+    const isAac = es && (es.oti === 0x40 || (es.oti >= 0x66 && es.oti <= 0x68)) &&
+      asc.aot >= 1 && asc.aot <= 4 && asc.sfi >= 0 && asc.sfi < AAC_RATES.length && asc.ch >= 1 && asc.ch <= 7;
+    if (!isAac) throw new UserError("unsupportedAudio", { codec: codec.trim() });
+
+    // 采样表：每帧多大（stsz）、每个 chunk 有几帧（stsc）、每个 chunk 在文件的哪里（stco / co64）
+    const stsz = child(v, stbl, "stsz"), stsc = child(v, stbl, "stsc");
+    const stco = child(v, stbl, "stco"), co64 = child(v, stbl, "co64");
+    if (!stsz || !stsc || !(stco || co64)) return null;
+    const constSize = v.getUint32(stsz.start + 4);
+    const count = v.getUint32(stsz.start + 8);
+    const sizes = new Uint32Array(count);
+    for (let i = 0; i < count; i++) {
+      sizes[i] = constSize || v.getUint32(stsz.start + 12 + i * 4);
+      if (sizes[i] > 8184) return null;      // ADTS 单帧长度上限 8191（含 7 字节头）
+    }
+    const runCount = v.getUint32(stsc.start + 4);
+    const runs = [];
+    for (let i = 0; i < runCount; i++) {
+      const o = stsc.start + 8 + i * 12;
+      runs.push({ first: v.getUint32(o), per: v.getUint32(o + 4) });
+    }
+    const offTable = stco || co64;
+    const chunkCount = v.getUint32(offTable.start + 4);
+    const offsetAt = (i) => stco ? v.getUint32(stco.start + 8 + i * 4)
+                                 : Number(v.getBigUint64(co64.start + 8 + i * 8));
+    const chunks = [];
+    let sample = 0, run = 0;
+    for (let c = 0; c < chunkCount && sample < count; c++) {
+      while (run + 1 < runs.length && runs[run + 1].first <= c + 1) run++;
+      const n = Math.min(runs[run].per, count - sample);
+      let len = 0;
+      for (let k = 0; k < n; k++) len += sizes[sample + k];
+      chunks.push({ offset: offsetAt(c), first: sample, n, len });
+      sample += n;
+    }
+
+    // 分批读取各 chunk 的音频数据
+    const parts = new Array(chunks.length);
+    const BATCH = 16;
+    for (let i = 0; i < chunks.length; i += BATCH) {
+      await Promise.all(chunks.slice(i, i + BATCH).map(async (c, k) => {
+        parts[i + k] = await readBytes(blob, c.offset, c.offset + c.len);
+      }));
+    }
+
+    // 每一帧前面加 7 字节 ADTS 头，拼成一个普通的 .aac 数据流
+    const profile = asc.aot - 1;
+    let total = 0;
+    for (let i = 0; i < sample; i++) total += sizes[i] + 7;
+    const out = new Uint8Array(total);
+    let pos = 0;
+    for (let ci = 0; ci < chunks.length; ci++) {
+      const c = chunks[ci], data = parts[ci];
+      if (data.length < c.len) break;        // 文件被截断：只保留完整的部分
+      let p = 0;
+      for (let k = 0; k < c.n; k++) {
+        const size = sizes[c.first + k];
+        const frameLen = size + 7;
+        out[pos++] = 0xff;
+        out[pos++] = 0xf1;
+        out[pos++] = (profile << 6) | (asc.sfi << 2) | (asc.ch >> 2);
+        out[pos++] = ((asc.ch & 3) << 6) | (frameLen >> 11);
+        out[pos++] = (frameLen >> 3) & 0xff;
+        out[pos++] = ((frameLen & 7) << 5) | 0x1f;
+        out[pos++] = 0xfc;
+        out.set(data.subarray(p, p + size), pos);
+        pos += size;
+        p += size;
+      }
+      parts[ci] = null;                      // 用完就释放，省内存
+    }
+    if (!pos) return null;
+    return pos === total ? out.buffer : out.buffer.slice(0, pos);
+  }
+
+  // 取不到音轨或不是 MP4/MOV 时返回 null；遇到不支持的音频编码抛出 UserError
+  async function extractAacAsAdts(blob) {
+    try {
+      return await extractAac(blob);
+    } catch (e) {
+      if (e instanceof UserError) throw e;
+      return null;
+    }
+  }
+  // ==== MP4-DEMUX-END ====
 
   // 这些平台的页面链接不是音视频文件，网页也没法从它们取流
   const PLATFORM_HOSTS = ["youtube.com", "youtu.be", "tiktok.com", "douyin.com", "instagram.com",
@@ -351,20 +578,40 @@
     }
     const ct = (res.headers.get("content-type") || "").toLowerCase();
     if (ct.startsWith("text/html")) throw new UserError("notMedia");
-    const buf = await res.arrayBuffer();
+    const blob = await res.blob();
     setStatus("decoding");
-    return decodeBuffer(buf);
+    return decodeTo16kMono(blob);
   }
 
-  async function decodeBuffer(buf) {
+  // 先直接交给浏览器解码；失败时（比如 iPad 上的 .mov）改为自己取出 AAC 音轨再解码
+  async function decodeToAudioBuffer(blob) {
+    let firstErr;
+    try {
+      return await decodeWithContext(await blob.arrayBuffer());
+    } catch (e) {
+      firstErr = e;
+    }
+    setStatus("extractAudio");
+    const adts = await extractAacAsAdts(blob); // 遇到不支持的音频编码会抛出 UserError
+    if (!adts) throw firstErr;
+    return await decodeWithContext(adts);
+  }
+
+  async function decodeWithContext(buf) {
     const AC = window.AudioContext || window.webkitAudioContext;
     const ctx = new AC();
-    let decoded;
     try {
-      decoded = await new Promise((res, rej) => ctx.decodeAudioData(buf, res, rej));
+      return await new Promise((res, rej) => {
+        // 新浏览器的 decodeAudioData 同时返回 Promise；接住它，避免出现"未处理的报错"
+        const p = ctx.decodeAudioData(buf, res, rej);
+        if (p && p.catch) p.catch(() => {});
+      });
     } finally {
       ctx.close && ctx.close();
     }
+  }
+
+  async function resampleTo16kMono(decoded) {
     const length = Math.ceil(decoded.duration * 16000);
     const off = new OfflineAudioContext(1, length, 16000);
     const src = off.createBufferSource();
