@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>本地转录</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --card: #ffffff; --text: #1f1e1b; --muted: #6b6a64;
+    --line: #e2e0d8; --accent: #c2622d; --accent-text: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1b1a18; --card: #262522; --text: #f0eee8; --muted: #a09e96;
+            --line: #3a3833; --accent: #e08a55; --accent-text: #1b1a18; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.6 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+         padding: max(16px, env(safe-area-inset-top)) 16px 40px; }
+  main { max-width: 720px; margin: 0 auto; }
+  .top { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 8px; }
+  h1 { font-size: 24px; margin: 0; }
+  #langBtn { padding: 6px 12px; font-size: 14px; border-radius: 999px; white-space: nowrap; }
+  .sub { color: var(--muted); margin: 4px 0 20px; font-size: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+          padding: 16px; margin-bottom: 14px; }
+  label { display: block; font-size: 14px; color: var(--muted); margin: 12px 0 6px; }
+  label:first-child { margin-top: 0; }
+  select, input[type=url] { width: 100%; padding: 10px; font-size: 16px; border-radius: 10px;
+          border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .hint { font-size: 13px; color: var(--muted); margin-top: 6px; }
+  /* 原生文件选择框的按钮文字由浏览器语言决定，无法翻译，所以隐藏它，改用自己的按钮 */
+  #file { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; pointer-events: none; }
+  .filepick { display: flex; align-items: center; gap: 10px; }
+  .filepick button { flex: none; padding: 10px 14px; }
+  #fileName { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+              font-size: 14px; color: var(--muted); }
+  .check { display: flex; gap: 8px; align-items: center; margin-top: 12px; font-size: 14px; color: var(--muted); }
+  .check input { width: 18px; height: 18px; }
+  button { font: inherit; padding: 12px 16px; border-radius: 10px; border: 1px solid var(--line);
+           background: var(--card); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent);
+                   width: 100%; margin-top: 16px; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin-top: 10px; display: none; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  #status { margin-top: 10px; font-size: 14px; color: var(--muted); min-height: 1.4em; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  #out { white-space: pre-wrap; word-break: break-word; font-size: 16px; }
+  .ts { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .note { font-size: 13px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <div class="top">
+    <h1 data-i18n="title">本地转录</h1>
+    <button id="langBtn" type="button" data-i18n="switchLang" aria-label="Switch language / 切换语言">English</button>
+  </div>
+  <p class="sub" data-i18n="sub">音频只在你的设备上处理，不会上传。首次使用需要联网下载一次模型。</p>
+
+  <div class="card">
+    <label for="file" data-i18n="fileLabel">选择音频或视频文件</label>
+    <div class="filepick">
+      <button id="pickBtn" type="button" data-i18n="chooseFile">选择文件</button>
+      <span id="fileName"></span>
+    </div>
+    <input id="file" type="file" accept="audio/*,video/*" tabindex="-1" aria-hidden="true">
+
+    <label for="url" data-i18n="urlLabel">或者粘贴音频 / 视频文件的直接链接</label>
+    <input id="url" type="url" inputmode="url" placeholder="https://example.com/audio.mp3"
+           autocomplete="off" autocapitalize="off" spellcheck="false">
+    <div class="hint" data-i18n="urlHint">只支持 .mp3、.m4a、.mp4 等文件本身的链接，YouTube、TikTok 等网页链接不行。</div>
+
+    <label for="model" data-i18n="modelLabel">模型（越大越准，也越慢、越占内存）</label>
+    <select id="model">
+      <option value="Xenova/whisper-tiny" data-i18n="modelTinyMulti">tiny 多语言（约 40MB，最快，适合手机）</option>
+      <option value="Xenova/whisper-base" data-i18n="modelBaseMulti" selected>base 多语言（约 80MB，推荐）</option>
+      <option value="Xenova/whisper-tiny.en" data-i18n="modelTinyEn">tiny 仅英文（约 40MB）</option>
+      <option value="Xenova/whisper-base.en" data-i18n="modelBaseEn">base 仅英文（约 80MB，英文更准）</option>
+    </select>
+
+    <label for="lang" data-i18n="langLabel">语言（仅多语言模型有效）</label>
+    <select id="lang">
+      <option value="auto" data-i18n="langAuto">自动检测</option>
+      <option value="english">English</option>
+      <option value="chinese">中文</option>
+      <option value="german">Deutsch</option>
+      <option value="hebrew">עברית</option>
+      <option value="japanese">日本語</option>
+      <option value="french">Français</option>
+      <option value="spanish">Español</option>
+    </select>
+
+    <div class="check">
+      <input id="gpu" type="checkbox">
+      <span data-i18n="gpuLabel">尝试 GPU 加速（WebGPU，部分设备可用，失败会自动改用 CPU）</span>
+    </div>
+
+    <button id="go" class="primary" disabled data-i18n="go">开始转录</button>
+    <div class="bar" id="bar"><div id="fill"></div></div>
+    <div id="status"></div>
+  </div>
+
+  <div class="card" id="resultCard" hidden>
+    <div class="actions">
+      <button id="copy" data-i18n="copy">复制文字</button>
+      <button id="dlTxt" data-i18n="dlTxt">下载 .txt</button>
+      <button id="dlSrt" data-i18n="dlSrt">下载 .srt 字幕</button>
+      <button id="toggle">切换：带时间轴</button>
+    </div>
+    <div id="out"></div>
+  </div>
+
+  <p class="note" data-i18n="note">提示：长视频会占用较多内存，手机和 iPad 上建议先用 tiny 或 base 模型。
+  不同视频格式在 Safari 里的解码支持不同，如果提示无法解码，请先把视频导出成 m4a、mp3 或 wav。</p>
+</main>
+
+<script type="module">
+  // ---------- 多语言文案 ----------
+  const I18N = {
+    zh: {
+      docTitle: "本地转录",
+      title: "本地转录",
+      switchLang: "English",
+      sub: "音频只在你的设备上处理，不会上传。首次使用需要联网下载一次模型。",
+      fileLabel: "选择音频或视频文件",
+      chooseFile: "选择文件",
+      noFile: "未选择任何文件",
+      urlLabel: "或者粘贴音频 / 视频文件的直接链接",
+      urlHint: "只支持 .mp3、.m4a、.mp4 等文件本身的链接，YouTube、TikTok 等网页链接不行。",
+      modelLabel: "模型（越大越准，也越慢、越占内存）",
+      modelTinyMulti: "tiny 多语言（约 40MB，最快，适合手机）",
+      modelBaseMulti: "base 多语言（约 80MB，推荐）",
+      modelTinyEn: "tiny 仅英文（约 40MB）",
+      modelBaseEn: "base 仅英文（约 80MB，英文更准）",
+      langLabel: "语言（仅多语言模型有效）",
+      langAuto: "自动检测",
+      gpuLabel: "尝试 GPU 加速（WebGPU，部分设备可用，失败会自动改用 CPU）",
+      go: "开始转录",
+      copy: "复制文字",
+      dlTxt: "下载 .txt",
+      dlSrt: "下载 .srt 字幕",
+      toggleShowTimes: "切换：带时间轴",
+      toggleShowPlain: "切换：纯文字",
+      note: "提示：长视频会占用较多内存，手机和 iPad 上建议先用 tiny 或 base 模型。不同视频格式在 Safari 里的解码支持不同，如果提示无法解码，请先把视频导出成 m4a、mp3 或 wav。",
+      // 状态提示
+      decoding: "正在读取并解码音频…",
+      downloadingLink: "正在读取链接中的文件…",
+      badUrl: "这个链接格式不对，请粘贴以 http:// 或 https:// 开头的完整链接。",
+      platformLink: "YouTube、TikTok 等平台的页面链接无法直接转录（网页不能读取它们的音视频）。请先把视频保存成文件，再点“选择文件”。",
+      fetchFail: "无法读取这个链接。可能它不是音视频文件本身，或对方服务器不允许网页跨站读取。请下载文件后用“选择文件”。",
+      notMedia: "这个链接返回的是网页，不是音视频文件。请换成文件本身的链接，或下载后用“选择文件”。",
+      httpError: "链接返回了错误：{message}",
+      loadingModel: "正在加载模型…",
+      downloadingFile: "正在下载模型文件：{file}",
+      downloadingModel: "正在下载模型…（只需一次）",
+      readyGpu: "模型已就绪（GPU 加速）",
+      gpuFallback: "GPU 不可用，自动改用 CPU（WebAssembly）",
+      readyCpu: "模型已就绪（CPU）",
+      transcribing: "正在转录，请稍候…",
+      done: "完成",
+      errorPrefix: "出错了：{message}",
+      workerError: "后台线程出错：{message}",
+      decodeFail: "无法解码这个文件：{message}。请先转成 m4a、mp3 或 wav 再试。",
+      unknownError: "未知错误",
+      unsupportedFormat: "格式不支持",
+      copied: "已复制",
+      copyFail: "复制失败，请长按文字手动复制",
+    },
+    en: {
+      docTitle: "Local Transcription",
+      title: "Local Transcription",
+      switchLang: "中文",
+      sub: "Audio is processed on your device only and is never uploaded. The first use needs an internet connection to download the model once.",
+      fileLabel: "Choose an audio or video file",
+      chooseFile: "Choose file",
+      noFile: "No file chosen",
+      urlLabel: "Or paste a direct link to an audio / video file",
+      urlHint: "Only links to the file itself work (.mp3, .m4a, .mp4 …). Page links from YouTube, TikTok and similar sites do not.",
+      modelLabel: "Model (larger = more accurate, but slower and uses more memory)",
+      modelTinyMulti: "tiny multilingual (~40MB, fastest, good for phones)",
+      modelBaseMulti: "base multilingual (~80MB, recommended)",
+      modelTinyEn: "tiny English-only (~40MB)",
+      modelBaseEn: "base English-only (~80MB, more accurate for English)",
+      langLabel: "Language (multilingual models only)",
+      langAuto: "Auto-detect",
+      gpuLabel: "Try GPU acceleration (WebGPU, available on some devices; falls back to CPU automatically)",
+      go: "Start transcribing",
+      copy: "Copy text",
+      dlTxt: "Download .txt",
+      dlSrt: "Download .srt subtitles",
+      toggleShowTimes: "Show timestamps",
+      toggleShowPlain: "Plain text",
+      note: "Tip: long videos use a lot of memory. On phones and iPads, start with the tiny or base model. Safari's support for video formats varies; if decoding fails, export the video as m4a, mp3 or wav first.",
+      // status messages
+      decoding: "Reading and decoding audio…",
+      downloadingLink: "Fetching the file from the link…",
+      badUrl: "That doesn't look like a valid link. Paste the full link starting with http:// or https://.",
+      platformLink: "Page links from YouTube, TikTok and similar sites can't be transcribed directly (a web page can't read their audio or video). Save the video as a file first, then use “Choose file”.",
+      fetchFail: "Couldn't read this link. It may not be the audio/video file itself, or the server doesn't allow cross-site reads from web pages. Download the file and use “Choose file” instead.",
+      notMedia: "This link returns a web page, not an audio/video file. Use a link to the file itself, or download it and use “Choose file”.",
+      httpError: "The link returned an error: {message}",
+      loadingModel: "Loading model…",
+      downloadingFile: "Downloading model file: {file}",
+      downloadingModel: "Downloading model… (one time only)",
+      readyGpu: "Model ready (GPU acceleration)",
+      gpuFallback: "GPU unavailable, switching to CPU (WebAssembly)",
+      readyCpu: "Model ready (CPU)",
+      transcribing: "Transcribing, please wait…",
+      done: "Done",
+      errorPrefix: "Something went wrong: {message}",
+      workerError: "Background thread error: {message}",
+      decodeFail: "Couldn't decode this file: {message}. Please convert it to m4a, mp3 or wav and try again.",
+      unknownError: "unknown error",
+      unsupportedFormat: "unsupported format",
+      copied: "Copied",
+      copyFail: "Copy failed. Long-press the text to copy it manually.",
+    },
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const fileEl = $("file"), goEl = $("go"), statusEl = $("status");
+  const bar = $("bar"), fill = $("fill");
+  const resultCard = $("resultCard"), out = $("out");
+
+  // ---------- 语言选择：记住上次的选择，第一次按浏览器语言 ----------
+  function loadLang() {
+    try {
+      const saved = localStorage.getItem("lang");
+      if (saved === "zh" || saved === "en") return saved;
+    } catch {}
+    return (navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+  }
+  let lang = loadLang();
+
+  function t(key, params) {
+    const dict = I18N[lang] || I18N.zh;
+    let s = dict[key] ?? I18N.zh[key] ?? key;
+    if (params) s = s.replace(/\{(\w+)\}/g, (_, k) => (params[k] ?? ""));
+    return s;
+  }
+
+  // 当前状态栏内容以"文案键 + 参数"保存，切换语言时可以重新翻译
+  let statusState = { key: null, params: null };
+  function renderStatus() {
+    const { key, params } = statusState;
+    if (!key) { statusEl.textContent = ""; return; }
+    const p = { ...(params || {}) };
+    if (("message" in p) && (p.message == null || p.message === "")) {
+      p.message = t(key === "decodeFail" ? "unsupportedFormat" : "unknownError");
+    }
+    statusEl.textContent = t(key, p);
+  }
+  function setStatus(key, params) {
+    statusState = { key, params: params || null };
+    renderStatus();
+  }
+
+  let worker = null;
+  let result = { text: "", chunks: [] };
+  let showTimes = false;
+  const fileProgress = {};
+
+  function applyLang() {
+    document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+    document.title = t("docTitle");
+    document.querySelectorAll("[data-i18n]").forEach((el) => {
+      el.textContent = t(el.dataset.i18n);
+    });
+    $("toggle").textContent = showTimes ? t("toggleShowPlain") : t("toggleShowTimes");
+    updateFileName();
+    renderStatus();
+  }
+
+  $("langBtn").addEventListener("click", () => {
+    lang = lang === "zh" ? "en" : "zh";
+    try { localStorage.setItem("lang", lang); } catch {}
+    applyLang();
+  });
+
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./sw.js").catch(() => {});
+  }
+
+  function setBar(p) {
+    bar.style.display = "block";
+    fill.style.width = Math.max(0, Math.min(100, p)) + "%";
+  }
+
+  function makeWorker() {
+    if (worker) worker.terminate();
+    worker = new Worker("./worker.js", { type: "module" });
+    worker.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === "status") setStatus(m.key, m.params);
+      else if (m.type === "progress") {
+        fileProgress[m.file] = m.progress;
+        const vals = Object.values(fileProgress);
+        setBar(vals.reduce((a, b) => a + b, 0) / vals.length);
+        setStatus("downloadingModel");
+      } else if (m.type === "done") {
+        result = { text: m.text, chunks: m.chunks };
+        render();
+        bar.style.display = "none";
+        setStatus("done");
+        goEl.disabled = false;
+      } else if (m.type === "error") {
+        bar.style.display = "none";
+        setStatus("errorPrefix", { message: m.message });
+        goEl.disabled = false;
+      }
+    };
+    worker.onerror = (e) => {
+      setStatus("workerError", { message: e.message || null });
+      goEl.disabled = false;
+    };
+  }
+
+  // 解码音频并重采样为 16kHz 单声道 Float32Array（Whisper 需要的格式）
+  async function decodeTo16kMono(file) {
+    return decodeBuffer(await file.arrayBuffer());
+  }
+
+  // 带"文案键"的错误：捕获后直接按当前语言显示，切换语言时也会跟着变
+  class UserError extends Error {
+    constructor(key, params) { super(key); this.key = key; this.params = params || null; }
+  }
+
+  // 这些平台的页面链接不是音视频文件，网页也没法从它们取流
+  const PLATFORM_HOSTS = ["youtube.com", "youtu.be", "tiktok.com", "douyin.com", "instagram.com",
+    "facebook.com", "fb.watch", "x.com", "twitter.com", "bilibili.com", "b23.tv", "vimeo.com"];
+  function isPlatformHost(host) {
+    host = host.toLowerCase();
+    return PLATFORM_HOSTS.some((h) => host === h || host.endsWith("." + h));
+  }
+
+  // 从直接文件链接读取音视频并解码。文件只是下载到本机内存里，不会上传到任何地方
+  async function loadAudioFromUrl(raw) {
+    let u;
+    try { u = new URL(raw.trim()); } catch { throw new UserError("badUrl"); }
+    if (u.protocol !== "http:" && u.protocol !== "https:") throw new UserError("badUrl");
+    if (isPlatformHost(u.hostname)) throw new UserError("platformLink");
+
+    setStatus("downloadingLink");
+    let res;
+    try { res = await fetch(u.href); } catch { throw new UserError("fetchFail"); }
+    if (!res.ok) {
+      throw new UserError("httpError", { message: `${res.status} ${res.statusText || ""}`.trim() });
+    }
+    const ct = (res.headers.get("content-type") || "").toLowerCase();
+    if (ct.startsWith("text/html")) throw new UserError("notMedia");
+    const buf = await res.arrayBuffer();
+    setStatus("decoding");
+    return decodeBuffer(buf);
+  }
+
+  async function decodeBuffer(buf) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AC();
+    let decoded;
+    try {
+      decoded = await new Promise((res, rej) => ctx.decodeAudioData(buf, res, rej));
+    } finally {
+      ctx.close && ctx.close();
+    }
+    const length = Math.ceil(decoded.duration * 16000);
+    const off = new OfflineAudioContext(1, length, 16000);
+    const src = off.createBufferSource();
+    src.buffer = decoded;
+    src.connect(off.destination); // 多声道自动混成单声道
+    src.start();
+    const rendered = await off.startRendering();
+    return rendered.getChannelData(0);
+  }
+
+  function fmt(t, srt = false) {
+    t = Math.max(0, t || 0);
+    const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = Math.floor(t % 60);
+    const ms = Math.round((t - Math.floor(t)) * 1000);
+    const p = (n, l = 2) => String(n).padStart(l, "0");
+    return srt ? `${p(h)}:${p(m)}:${p(s)},${p(ms, 3)}` : `${p(m + h * 60)}:${p(s)}`;
+  }
+
+  function render() {
+    resultCard.hidden = false;
+    out.innerHTML = "";
+    if (showTimes && result.chunks.length) {
+      result.chunks.forEach((c) => {
+        const line = document.createElement("div");
+        const ts = document.createElement("span");
+        ts.className = "ts";
+        ts.textContent = `[${fmt(c.timestamp[0])}] `;
+        line.append(ts, document.createTextNode((c.text || "").trim()));
+        out.append(line);
+      });
+    } else {
+      out.textContent = result.text;
+    }
+  }
+
+  function toSrt() {
+    return result.chunks.map((c, i) => {
+      const [a, b] = c.timestamp;
+      return `${i + 1}\n${fmt(a, true)} --> ${fmt(b ?? a + 2, true)}\n${(c.text || "").trim()}\n`;
+    }).join("\n");
+  }
+
+  function download(name, text) {
+    const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  function updateFileName() {
+    $("fileName").textContent = fileEl.files.length ? fileEl.files[0].name : t("noFile");
+  }
+  // 文件和链接二选一：谁最后被填写就用谁
+  const urlEl = $("url");
+  let source = "file";
+  function updateGo() {
+    goEl.disabled = !(fileEl.files.length || urlEl.value.trim());
+  }
+  $("pickBtn").addEventListener("click", () => fileEl.click());
+  fileEl.addEventListener("change", () => {
+    if (fileEl.files.length) source = "file";
+    updateGo();
+    updateFileName();
+  });
+  urlEl.addEventListener("input", () => {
+    if (urlEl.value.trim()) source = "url";
+    updateGo();
+  });
+
+  goEl.addEventListener("click", async () => {
+    const file = fileEl.files[0];
+    const url = urlEl.value.trim();
+    if (!file && !url) return;
+    const useUrl = !!url && (source === "url" || !file);
+    goEl.disabled = true;
+    resultCard.hidden = true;
+    Object.keys(fileProgress).forEach((k) => delete fileProgress[k]);
+    try {
+      setStatus("decoding");
+      setBar(0);
+      const audio = useUrl ? await loadAudioFromUrl(url) : await decodeTo16kMono(file);
+      makeWorker();
+      worker.postMessage({
+        type: "transcribe",
+        audio,
+        model: $("model").value,
+        language: $("lang").value,
+        useGPU: $("gpu").checked,
+      }, [audio.buffer]);
+    } catch (err) {
+      bar.style.display = "none";
+      if (err instanceof UserError) setStatus(err.key, err.params);
+      else setStatus("decodeFail", { message: (err && err.message) ? err.message : null });
+      goEl.disabled = false;
+    }
+  });
+
+  $("copy").onclick = async () => {
+    try { await navigator.clipboard.writeText(result.text); setStatus("copied"); }
+    catch { setStatus("copyFail"); }
+  };
+  $("dlTxt").onclick = () => download("transcript.txt", result.text);
+  $("dlSrt").onclick = () => download("subtitles.srt", toSrt());
+  $("toggle").onclick = () => {
+    showTimes = !showTimes;
+    $("toggle").textContent = showTimes ? t("toggleShowPlain") : t("toggleShowTimes");
+    render();
+  };
+
+  applyLang();
+</script>
+</body>
+</html>
